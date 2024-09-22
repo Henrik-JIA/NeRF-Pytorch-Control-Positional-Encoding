@@ -5,7 +5,8 @@ import imageio
 import json
 import torch.nn.functional as F
 import cv2
-
+import open3d as o3d
+import matplotlib.pyplot as plt
 
 trans_t = lambda t : torch.Tensor([
     [1,0,0,0],
@@ -33,8 +34,58 @@ def pose_spherical(theta, phi, radius):
     c2w = torch.Tensor(np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]])) @ c2w
     return c2w
 
+def show_poses(poses, frustum_size=0.1, axis_size=0.2):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    for pose in poses:
+        extrinsic = np.array(pose, dtype=np.float64)
+        frustum = o3d.geometry.LineSet()
+        points = [
+            [0, 0, 0],  # 相机位置
+            [frustum_size, frustum_size, frustum_size * 2], [-frustum_size, frustum_size, frustum_size * 2], 
+            [-frustum_size, -frustum_size, frustum_size * 2], [frustum_size, -frustum_size, frustum_size * 2],  # 前视面
 
-def load_blender_data(basedir, half_res=False, testskip=1):
+            [frustum_size * 2, frustum_size * 2, frustum_size * 4], [-frustum_size * 2, frustum_size * 2, frustum_size * 4], 
+            [-frustum_size * 2, -frustum_size * 2, frustum_size * 4], [frustum_size * 2, -frustum_size * 2, frustum_size * 4]   # 后视面
+        ]
+        lines = [
+            [0, 1], [0, 2], [0, 3], [0, 4],  # 相机位置到前视面
+            [1, 2], [2, 3], [3, 4], [4, 1],  # 前视面
+            [5, 6], [6, 7], [7, 8], [8, 5],  # 后视面
+            [1, 5], [2, 6], [3, 7], [4, 8]   # 前视面到后视面
+        ]
+        frustum.points = o3d.utility.Vector3dVector(points)
+        frustum.lines = o3d.utility.Vector2iVector(lines)
+        frustum.paint_uniform_color([1.0, 0.0, 0.0])  # 设置颜色为红色
+        frustum.transform(extrinsic)
+        vis.add_geometry(frustum)
+        # 添加方向箭头
+        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_size)
+        axis.transform(extrinsic)
+        vis.add_geometry(axis)
+    vis.run()
+    vis.destroy_window()
+
+
+def show_imgs(imgs):
+    num_imgs = len(imgs)
+    cols = 5
+    rows = (num_imgs // cols) + (1 if num_imgs % cols != 0 else 0)
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(15, rows * 3))
+    axes = axes.flatten()
+    
+    for i, img in enumerate(imgs):
+        axes[i].imshow(img[:, :, :3])
+        axes[i].axis('off')
+    
+    for i in range(num_imgs, len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+def load_blender_data(basedir, half_res=False, testskip=1, visualize_poses=False, visualize_imgs=False):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -67,6 +118,13 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     
     imgs = np.concatenate(all_imgs, 0)
     poses = np.concatenate(all_poses, 0)
+
+    # Add this line to visualize the poses
+    if visualize_poses:
+        show_poses(poses) 
+    # Add this line to visualize the images
+    if visualize_imgs:
+        show_imgs(imgs)
     
     H, W = imgs[0].shape[:2]
     camera_angle_x = float(meta['camera_angle_x'])

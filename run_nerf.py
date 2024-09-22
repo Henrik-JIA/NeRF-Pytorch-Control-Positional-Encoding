@@ -178,12 +178,20 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    if args.use_embedder:
+        embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    else:
+        embed_fn = lambda x: x
+        input_ch = 3  # Assuming input is 3D coordinates without embedding
 
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+        if args.use_embedder:
+            embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+        else:
+            embeddirs_fn = lambda x: x  # 不进行位置编码
+            input_ch_views = 3  # 假设输入是 3D 方向
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
@@ -256,7 +264,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, embed_fn
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -380,7 +388,6 @@ def render_rays(ray_batch,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
-
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
@@ -418,17 +425,17 @@ def render_rays(ray_batch,
     return ret
 
 
-def config_parser():
+def config_parser(config_file):
 
     import configargparse
-    parser = configargparse.ArgumentParser()
+    parser = configargparse.ArgumentParser(default_config_files=[config_file])
     parser.add_argument('--config', is_config_file=True, 
                         help='config file path')
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
+    parser.add_argument("--datadir", type=str, default='./data/nerf_synthetic/lego',
                         help='input data directory')
 
     # training options
@@ -489,7 +496,7 @@ def config_parser():
                         default=.5, help='fraction of img taken for central crops') 
 
     # dataset options
-    parser.add_argument("--dataset_type", type=str, default='llff', 
+    parser.add_argument("--dataset_type", type=str, default='blender', 
                         help='options: llff / blender / deepvoxels')
     parser.add_argument("--testskip", type=int, default=8, 
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
@@ -528,12 +535,29 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+    # New parameters
+    # Visualize poses for blender dataset
+    parser.add_argument("--visualize_poses", type=bool, default=False, 
+                        help='visualize poses for blender dataset')
+    # Visualize images for blender dataset
+    parser.add_argument("--visualize_imgs", type=bool, default=False, 
+                        help='visualize images for blender dataset')
+    # Use positional encoding for input coordinates
+    parser.add_argument("--use_embedder", type=bool, default=True, 
+                        help='use positional encoding for input coordinates')
+    # Save positional encoding results
+    parser.add_argument("--save_embed_result", type=bool, default=True, 
+                        help='save positional encoding results')
+    # Save positional encoding results at specific iteration
+    parser.add_argument("--save_embed_iter", type=int, default=500, 
+                        help='iteration to save positional encoding results')
+
     return parser
 
 
-def train():
+def train(config_file):
 
-    parser = config_parser()
+    parser = config_parser(config_file)
     args = parser.parse_args()
 
     # Load data
@@ -567,7 +591,13 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
+        images, poses, render_poses, hwf, i_split = load_blender_data(
+            args.datadir, 
+            args.half_res, 
+            args.testskip, 
+            visualize_poses=args.visualize_poses, 
+            visualize_imgs=args.visualize_imgs
+        )
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
@@ -637,7 +667,11 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, embed_fn = create_nerf(args)
+
+    # 生成固定的样本坐标
+    sample_coords = torch.rand((100, 3)).to(device)  # 生成100个固定的随机坐标
+
     global_step = start
 
     bds_dict = {
@@ -760,6 +794,14 @@ def train():
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
+        
+        # print(f"coords shape: {coords.shape}, dtype: {coords.dtype}")
+        # print(f"select_inds shape: {select_inds.shape}, dtype: {select_inds.dtype}")
+        # print(f"select_coords shape: {select_coords.shape}, dtype: {select_coords.dtype}")
+        # print(f"rays_o shape after selection: {rays_o.shape}, dtype: {rays_o.dtype}")
+        # print(f"rays_d shape after selection: {rays_d.shape}, dtype: {rays_d.dtype}")
+        # print(f"rgb shape: {rgb.shape}, dtype: {rgb.dtype}")
+        # print(f"batch_rays shape: {batch_rays.shape}, dtype: {batch_rays.dtype}")
 
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
@@ -787,6 +829,94 @@ def train():
         dt = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
+
+        # save embed result
+        if args.save_embed_result and i == args.save_embed_iter:
+            # Whether to save the location encoding result
+            if args.use_embedder: # Positional encoding is used
+                embedded_coords = embed_fn(sample_coords).cpu().numpy()
+                os.makedirs(os.path.join(basedir, expname), exist_ok=True)  # 确保目录存在
+                np.save(os.path.join(basedir, expname, 'embedded_coords_with_encoding.npy'), embedded_coords)
+            else: # Positional encoding is not used
+                no_embed_fn = lambda x: x  
+                no_embedded_coords = no_embed_fn(sample_coords).cpu().numpy()
+                os.makedirs(os.path.join(basedir, expname), exist_ok=True)  # 确保目录存在
+                np.save(os.path.join(basedir, expname, 'embedded_coords_without_encoding.npy'), no_embedded_coords)
+
+            # Draw a comparison map of position coding results(compare with original image)
+            original_coords = sample_coords.cpu().numpy()
+            plt.figure(figsize=(10, 10))
+            plt.imshow(original_coords, aspect='auto')
+            plt.colorbar()
+            plt.title('Original Coordinates')
+            plt.savefig(os.path.join(basedir, expname, 'original_coords.png'))
+            plt.show()
+
+            # 绘制有位置编码
+            if args.use_embedder:
+                embedded_coords_path = os.path.join(basedir, expname, 'embedded_coords_with_encoding.npy')
+                if os.path.exists(embedded_coords_path):
+                    embedded_coords_with = np.load(embedded_coords_path)
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(embedded_coords_with, aspect='auto')
+                    plt.colorbar()
+                    plt.title('With Position Encoding')
+                    plt.savefig(os.path.join(basedir, expname, 'position_encoding_with.png'))
+                    plt.show()
+
+            # 绘制没有位置编码的结果
+            embedded_coords_path = os.path.join(basedir, expname, 'embedded_coords_without_encoding.npy')
+            if os.path.exists(embedded_coords_path):
+                embedded_coords_without = np.load(embedded_coords_path)
+                plt.figure(figsize=(10, 10))
+                plt.imshow(embedded_coords_without, aspect='auto')
+                plt.colorbar()
+                plt.title('Without Position Encoding')
+                plt.savefig(os.path.join(basedir, expname, 'position_encoding_without.png'))
+                plt.show()
+
+            # 比较有位置编码或没有位置编码的MLP输出结果与监督图像之间的差异
+            with torch.no_grad():
+                # 获取监督图像
+                img_i = np.random.choice(i_train)
+                target = images[img_i]
+                target = torch.Tensor(target).to(device)
+                pose = poses[img_i, :3, :4]
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                rays_o = torch.reshape(rays_o, [-1, 3]).float()
+                rays_d = torch.reshape(rays_d, [-1, 3]).float()
+                batch_rays = torch.stack([rays_o, rays_d], 0)
+                # print(f"rays_o shape: {rays_o.shape}, dtype: {rays_o.dtype}")
+                # print(f"rays_d shape: {rays_d.shape}, dtype: {rays_d.dtype}")
+                # print(f"batch_rays shape: {batch_rays.shape}, dtype: {batch_rays.dtype}")
+
+                # compare with original image
+                if args.use_embedder: # Positional encoding is used
+                    rgb_with, _, _, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+                    rgb_with = rgb_with.cpu().numpy()
+                    rgb_with = rgb_with.reshape(H, W, 3) 
+                    plt.figure(figsize=(20, 10))
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(target.cpu().numpy())
+                    plt.title('Ground Truth')
+                    plt.subplot(1, 2, 2)
+                    plt.imshow(rgb_with)
+                    plt.title('With Position Encoding')
+                    plt.savefig(os.path.join(basedir, expname, 'comparison_with_encoding.png'))
+                    plt.show()
+                else: # Positional encoding is not used
+                    rgb_without, disp_without, acc_without, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+                    rgb_without = rgb_without.cpu().numpy()
+                    rgb_without = rgb_without.reshape(H, W, 3) 
+                    plt.figure(figsize=(20, 10))
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(target.cpu().numpy())
+                    plt.title('Ground Truth')
+                    plt.subplot(1, 2, 2)
+                    plt.imshow(rgb_without)
+                    plt.title('Without Position Encoding')
+                    plt.savefig(os.path.join(basedir, expname, 'comparison_without_encoding.png'))
+                    plt.show()
 
         # Rest is logging
         if i%args.i_weights==0:
@@ -871,8 +1001,8 @@ def train():
 
         global_step += 1
 
-
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    train()
+    # 默认使用lego数据集
+    train(config_file="configs/lego.txt")
